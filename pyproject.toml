@@ -20,6 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 train = [
     "opencv-python>=4.8.0",
+    "h5py>=3.10.0",
     "wandb>=0.16.0",
     "tqdm>=4.66.0",
     "einops==0.8.1",

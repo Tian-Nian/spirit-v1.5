@@ -7,7 +7,7 @@
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import cv2
 import numpy as np
@@ -29,7 +29,7 @@ class DataConfig:
 class RoboChallengeDataset(torch.utils.data.Dataset):
     """RoboChallenge Dataset.
 
-    Currently only supports the 'move objects into box' task with Franka robot.
+    Supports the original single-arm Spirit finetune format and a dual-arm EE format.
 
     directory structure:
         {data_root}/
@@ -45,9 +45,10 @@ class RoboChallengeDataset(torch.utils.data.Dataset):
                     └── side_realsense_rgb.mp4
 
     state encode:
-        raw: ee_positions[7] = [x, y, z, qx, qy, qz, qw] + gripper_width[1]
-        7D: [x, y, z, rx, ry, rz, gripper]  (rotvec from quat)
-        14D: [7D_valid | zeros(7)]  (zero-pad for dual-arm compat)
+        single arm raw: ee_positions[7] = [x, y, z, qx, qy, qz, qw] + gripper_width[1]
+        dual arm raw: left/right ee_positions[7] + left/right gripper_width[1]
+        internal: [left xyz, left rotvec, left gripper, right xyz, right rotvec, right gripper]
+        single-arm data is zero-padded on the right arm branch.
 
     action encode(delta):
         delta_xyz[3] = action_xyz - state_xyz
@@ -58,14 +59,33 @@ class RoboChallengeDataset(torch.utils.data.Dataset):
 
     Memory Optimization while training:
         Store state data as compact NumPy arrays instead of Python dicts for memory optimization.
-        _state_data: [N_total, 9] float64  (ee_positions[7] + gripper_width[1] + timestamp[1])
+        _state_data: [N_total, D] float64  (state payload + timestamp)
         _ep_offsets: [num_episodes] int64   (offset of each episode in _state_data)
         _ep_lengths: [num_episodes] int64   (frames per episode)
     """
 
-    _EE_SLICE = slice(0, 7)
-    _GRIPPER_IDX = 7
-    _TS_IDX = 8
+    _SINGLE_EE_SLICE = slice(0, 7)
+    _SINGLE_GRIPPER_IDX = 7
+    _SINGLE_TS_IDX = 8
+
+    _LEFT_EE_SLICE = slice(0, 7)
+    _LEFT_GRIPPER_IDX = 7
+    _RIGHT_EE_SLICE = slice(8, 15)
+    _RIGHT_GRIPPER_IDX = 15
+    _DUAL_TS_IDX = 16
+
+    _DEFAULT_CAMERA_VIDEOS = {
+        "Franka": {
+            "observation.images.cam_high": "main_realsense_rgb",
+            "observation.images.cam_left_wrist": "handeye_realsense_rgb",
+            "observation.images.cam_right_wrist": "side_realsense_rgb",
+        },
+        "aloha": {
+            "observation.images.cam_high": "head_camera_rgb",
+            "observation.images.cam_left_wrist": "left_camera_rgb",
+            "observation.images.cam_right_wrist": "right_camera_rgb",
+        },
+    }
 
     def __init__(self, config):
         self.data_root = Path(config.data_root)
@@ -73,13 +93,16 @@ class RoboChallengeDataset(torch.utils.data.Dataset):
         self.chunk_size = config.chunk_size
         self.state_history = config.state_history
 
-        self.task_name, self.task_prompt = self._load_task_info()
-        if self.task_name != "move_objects_into_box":
-            raise ValueError(
-                f"Unsupported task: '{self.task_name}'. "
-                f"Currently only 'move_objects_into_box' is supported."
-            )
+        task_info = self._load_task_info()
+        self.task_name = task_info["task_name"]
+        self.task_prompt = task_info["task_prompt"]
+        self.robot_type = task_info["robot_type"]
+        self.state_encoding = task_info["state_encoding"]
+        self.fps = float(task_info["fps"])
+        self.camera_videos = task_info["camera_videos"]
+
         self._state_data, self._ep_offsets, self._ep_lengths = self._load_all_states()
+        self._episode_prompts = self._load_episode_prompts()
         self.index: List[Tuple[int, int]] = self._build_index()
 
         self._resize = Resize((240, 320), antialias=True)
@@ -123,8 +146,8 @@ class RoboChallengeDataset(torch.utils.data.Dataset):
             "observation.state": state,
             "action": actions,
             "action_mask": action_mask,
-            "task": self.task_prompt,
-            "robot_type": "Franka",
+            "task": self._episode_prompts[episode_idx],
+            "robot_type": self.robot_type,
         }
 
     def get_lowdim_item(self, idx: int) -> dict:
@@ -139,7 +162,7 @@ class RoboChallengeDataset(torch.utils.data.Dataset):
             "action_mask": action_mask,
         }
 
-    def _load_task_info(self) -> Tuple[str, str]:
+    def _load_task_info(self) -> Dict[str, Any]:
         task_file = self.data_root / "meta" / "task_info.json"
         if not task_file.exists():
             raise FileNotFoundError(
@@ -157,7 +180,43 @@ class RoboChallengeDataset(torch.utils.data.Dataset):
                 f"Missing required field in {task_file}: {e}\n"
                 f"Expected structure: {{'task_desc': {{'task_name': ..., 'prompt': ...}}}}"
             )
-        return task_name, task_prompt
+        robot_type = data.get("robot_type", "Franka")
+        state_encoding = data.get("state_encoding", "single_arm_ee")
+        fps = data.get("fps", 30.0)
+        camera_videos = data.get("camera_videos")
+        if camera_videos is None:
+            camera_videos = self._DEFAULT_CAMERA_VIDEOS.get(robot_type, self._DEFAULT_CAMERA_VIDEOS["Franka"])
+
+        return {
+            "task_name": task_name,
+            "task_prompt": task_prompt,
+            "robot_type": robot_type,
+            "state_encoding": state_encoding,
+            "fps": fps,
+            "camera_videos": camera_videos,
+        }
+
+    @staticmethod
+    def _as_scalar_or_singleton_list(value: Any) -> List[float]:
+        if isinstance(value, list):
+            return value
+        return [float(value)]
+
+    def _build_state_row(self, raw_state: Dict[str, Any]) -> List[float]:
+        if self.state_encoding == "dual_arm_ee":
+            return (
+                raw_state["left_ee_positions"]
+                + self._as_scalar_or_singleton_list(raw_state["left_gripper_width"])
+                + raw_state["right_ee_positions"]
+                + self._as_scalar_or_singleton_list(raw_state["right_gripper_width"])
+                + [raw_state["timestamp"]]
+            )
+
+        return (
+            raw_state["ee_positions"]
+            + self._as_scalar_or_singleton_list(raw_state["gripper_width"])
+            + [raw_state["timestamp"]]
+        )
 
     def _load_all_states(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         data_dir = self.data_root / "data"
@@ -171,7 +230,7 @@ class RoboChallengeDataset(torch.utils.data.Dataset):
             with open(states_file) as f:
                 for line in f:
                     d = json.loads(line)
-                    row = d["ee_positions"] + d["gripper_width"] + [d["timestamp"]]
+                    row = self._build_state_row(d)
                     ep_rows.append(row)
             all_rows.extend(ep_rows)
             ep_lengths.append(len(ep_rows))
@@ -182,6 +241,19 @@ class RoboChallengeDataset(torch.utils.data.Dataset):
         ep_offsets[1:] = np.cumsum(ep_lengths[:-1])
 
         return state_data, ep_offsets, ep_lengths
+
+    def _load_episode_prompts(self) -> List[str]:
+        prompts: List[str] = []
+        data_dir = self.data_root / "data"
+        for ep_dir in sorted(data_dir.glob("episode_*")):
+            prompt = self.task_prompt
+            ep_meta_file = ep_dir / "meta" / "episode_meta.json"
+            if ep_meta_file.exists():
+                with open(ep_meta_file) as f:
+                    ep_meta = json.load(f)
+                prompt = ep_meta.get("prompt", prompt)
+            prompts.append(prompt)
+        return prompts
 
     def _build_index(self) -> List[Tuple[int, int]]:
         index = []
@@ -195,14 +267,8 @@ class RoboChallengeDataset(torch.utils.data.Dataset):
         ep_dir = self.data_root / "data" / f"episode_{episode_idx:06d}"
         video_dir = ep_dir / "videos"
 
-        camera_names = [
-            ("main_realsense_rgb", "observation.images.cam_high"),
-            ("handeye_realsense_rgb", "observation.images.cam_left_wrist"),
-            ("side_realsense_rgb", "observation.images.cam_right_wrist"),
-        ]
-
         images = {}
-        for video_name, key in camera_names:
+        for key, video_name in self.camera_videos.items():
             video_path = video_dir / f"{video_name}.mp4"
             frame = self._decode_video_frame(video_path, frame_idx)
             images[key] = frame
@@ -231,57 +297,84 @@ class RoboChallengeDataset(torch.utils.data.Dataset):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         state_idx = max(0, frame_idx - 1)
         row = self._get_state_row(episode_idx, state_idx)
-        ee_pos = row[self._EE_SLICE]
-        xyz = ee_pos[:3]
-        quat = ee_pos[3:]
-        rot = Rotation.from_quat(quat)
-        rotvec = rot.as_rotvec()
-        gripper = np.array([row[self._GRIPPER_IDX]])
-        state_7d = np.concatenate([xyz, rotvec, gripper])
-        state_14d = np.pad(state_7d, (0, 7), mode="constant")
-        state_mask = np.zeros(14, dtype=bool)
-        state_mask[:7] = True
+        if self.state_encoding == "dual_arm_ee":
+            left_state = self._encode_arm_state(row[self._LEFT_EE_SLICE], row[self._LEFT_GRIPPER_IDX])
+            right_state = self._encode_arm_state(row[self._RIGHT_EE_SLICE], row[self._RIGHT_GRIPPER_IDX])
+            state_14d = np.concatenate([left_state, right_state])
+            state_mask = np.ones(14, dtype=bool)
+        else:
+            state_7d = self._encode_arm_state(row[self._SINGLE_EE_SLICE], row[self._SINGLE_GRIPPER_IDX])
+            state_14d = np.pad(state_7d, (0, 7), mode="constant")
+            state_mask = np.zeros(14, dtype=bool)
+            state_mask[:7] = True
 
         return (
             torch.from_numpy(state_14d).float().unsqueeze(0),
             torch.from_numpy(state_mask).unsqueeze(0),
         )
 
+    @staticmethod
+    def _encode_arm_state(ee_pos: np.ndarray, gripper_value: float) -> np.ndarray:
+        xyz = ee_pos[:3]
+        quat = ee_pos[3:]
+        rotvec = Rotation.from_quat(quat).as_rotvec()
+        gripper = np.array([gripper_value])
+        return np.concatenate([xyz, rotvec, gripper])
+
+    @staticmethod
+    def _encode_arm_action(curr_pose: np.ndarray, curr_gripper: float, target_pose: np.ndarray, target_gripper: float) -> np.ndarray:
+        curr_xyz = curr_pose[:3]
+        curr_rot = Rotation.from_quat(curr_pose[3:])
+        target_xyz = target_pose[:3]
+        target_rot = Rotation.from_quat(target_pose[3:])
+
+        delta_xyz = target_xyz - curr_xyz
+        delta_rotvec = (target_rot * curr_rot.inv()).as_rotvec()
+        return np.concatenate([delta_xyz, delta_rotvec, np.array([target_gripper])])
+
     def _encode_actions(
         self, episode_idx: int, frame_idx: int
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         ref_idx = max(0, frame_idx - 1)
         ep_len = self._get_ep_length(episode_idx)
-        fps = 30.0
 
         curr_row = self._get_state_row(episode_idx, ref_idx)
-        curr_xyz = curr_row[:3]
-        curr_quat = curr_row[3:7]
-        curr_rot = Rotation.from_quat(curr_quat)
 
         actions_list = []
         action_is_pad_list = []
         last_valid_action = None
         num_steps = min(self.chunk_size, self.action_horizon)
         for i in range(num_steps):
-            delta_ts = i / fps
-            target_idx = frame_idx + round(delta_ts * fps)
+            target_idx = frame_idx + i
 
             if target_idx < ep_len:
                 target_row = self._get_state_row(episode_idx, target_idx)
             else:
                 target_row = self._get_state_row(episode_idx, ep_len - 1)
 
-            target_xyz = target_row[:3]
-            target_quat = target_row[3:7]
-            target_rot = Rotation.from_quat(target_quat)
-            target_gripper = np.array([target_row[self._GRIPPER_IDX]])
+            if self.state_encoding == "dual_arm_ee":
+                left_action = self._encode_arm_action(
+                    curr_row[self._LEFT_EE_SLICE],
+                    curr_row[self._LEFT_GRIPPER_IDX],
+                    target_row[self._LEFT_EE_SLICE],
+                    target_row[self._LEFT_GRIPPER_IDX],
+                )
+                right_action = self._encode_arm_action(
+                    curr_row[self._RIGHT_EE_SLICE],
+                    curr_row[self._RIGHT_GRIPPER_IDX],
+                    target_row[self._RIGHT_EE_SLICE],
+                    target_row[self._RIGHT_GRIPPER_IDX],
+                )
+                action_14d = np.concatenate([left_action, right_action])
+            else:
+                action_7d = self._encode_arm_action(
+                    curr_row[self._SINGLE_EE_SLICE],
+                    curr_row[self._SINGLE_GRIPPER_IDX],
+                    target_row[self._SINGLE_EE_SLICE],
+                    target_row[self._SINGLE_GRIPPER_IDX],
+                )
+                action_14d = np.pad(action_7d, (0, 7), mode="constant")
 
-            delta_xyz = target_xyz - curr_xyz
-            delta_rot = target_rot * curr_rot.inv()
-            delta_rotvec = delta_rot.as_rotvec()
-            action_7d = np.concatenate([delta_xyz, delta_rotvec, target_gripper])
-            action_14d = np.pad(action_7d, (0, 7), mode="constant")
             if target_idx < ep_len:
                 last_valid_action = action_14d
                 actions_list.append(action_14d)
@@ -299,7 +392,10 @@ class RoboChallengeDataset(torch.utils.data.Dataset):
         actions[:num_valid] = np.array(actions_list)
 
         action_mask = np.zeros((self.action_horizon, 14), dtype=bool)
-        action_mask[:num_valid, :7] = True
+        if self.state_encoding == "dual_arm_ee":
+            action_mask[:num_valid, :] = True
+        else:
+            action_mask[:num_valid, :7] = True
 
         action_is_pad = np.ones(self.action_horizon, dtype=bool)
         action_is_pad[:num_valid] = np.array(action_is_pad_list, dtype=bool)

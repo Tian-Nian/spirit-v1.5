@@ -129,15 +129,20 @@ def main():
     )
 
     sampler = DistributedSampler(dataset, shuffle=True) if world_size > 1 else None
+    dataloader_kwargs = {
+        "batch_size": args.batch_size,
+        "sampler": sampler,
+        "shuffle": (sampler is None),
+        "num_workers": args.num_workers,
+        "collate_fn": dataset.collate_fn,
+        "pin_memory": True,
+    }
+    if args.num_workers > 0:
+        dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
+
     dataloader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
-        sampler=sampler,
-        shuffle=(sampler is None),
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-        collate_fn=dataset.collate_fn,
-        pin_memory=True,
+        **dataloader_kwargs,
     )
 
     logger.print("Creating model...")
